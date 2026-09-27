@@ -13,7 +13,6 @@ static bool nm_block_isolated_uids = false;
 static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
 {
     struct nm_uid_array *arr;
-    bool blocked = false;
 
     if (unlikely(READ_ONCE(nm_block_isolated_uids))) {
         uid_t app_id = target_uid % 100000U;
@@ -22,14 +21,19 @@ static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
 
     if (likely(!rcu_access_pointer(nomount_uids)))
         return false;
+
     rcu_read_lock();
-    if ((arr = rcu_dereference(nomount_uids))) {
+    arr = rcu_dereference(nomount_uids);
+    if (arr) {
         int count = READ_ONCE(arr->count);
         int pos = nm_uid_index(arr, target_uid, count);
-        blocked = (pos < count && arr->uids[pos] == target_uid);
+        if (pos < count && arr->uids[pos] == target_uid) {
+            rcu_read_unlock();
+            return true;
+        }
     }
     rcu_read_unlock();
-    return blocked;
+    return false;
 }
 
 static __always_inline struct nomount_leaf *nomount_bsearch_child(struct nomount_child_array *arr, const char *name, size_t len, u32 hash, int *index)
@@ -703,7 +707,16 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 
     if (info->dir_node) {
         u32 v_hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
-        if ((res = nomount_resolve_rule_dentry(dir, dentry, info->dir_node, v_hash)) != ERR_PTR(-ENODATA))
+        struct nomount_child_array *children;
+        u64 bloom_mask;
+
+        rcu_read_lock();
+        children = rcu_dereference(info->dir_node->children);
+        bloom_mask = children ? children->bloom_mask : 0;
+        rcu_read_unlock();
+
+        if ((bloom_mask & (1ULL << (v_hash & 63))) &&
+            (res = nomount_resolve_rule_dentry(dir, dentry, info->dir_node, v_hash)) != ERR_PTR(-ENODATA))
                 return res;
     }
 
