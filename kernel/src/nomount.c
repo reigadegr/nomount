@@ -13,7 +13,6 @@ static bool nm_block_isolated_uids = false;
 static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
 {
     struct nm_uid_array *arr;
-    bool blocked = false;
 
     if (unlikely(READ_ONCE(nm_block_isolated_uids))) {
         uid_t app_id = target_uid % 100000U;
@@ -22,14 +21,19 @@ static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
 
     if (likely(!rcu_access_pointer(nomount_uids)))
         return false;
+
     rcu_read_lock();
-    if ((arr = rcu_dereference(nomount_uids))) {
+    arr = rcu_dereference(nomount_uids);
+    if (arr) {
         int count = READ_ONCE(arr->count);
         int pos = nm_uid_index(arr, target_uid, count);
-        blocked = (pos < count && arr->uids[pos] == target_uid);
+        if (pos < count && arr->uids[pos] == target_uid) {
+            rcu_read_unlock();
+            return true;
+        }
     }
     rcu_read_unlock();
-    return blocked;
+    return false;
 }
 
 static __always_inline struct nomount_rule *nomount_bsearch_child(struct nomount_child_array *arr, const char *name, size_t len, u32 hash, int *index)
@@ -79,7 +83,7 @@ static bool __nomount_get_rule_info(struct nomount_dir_node *dir_node, const cha
 		}
 
 		if (rule && rule->target_uid && rule->target_uid != current_fsuid().val)
-			rule = NULL;
+			return false;
 	}
 
 	if (!rule) return false;
@@ -726,7 +730,8 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 
     if (info->dir_node) {
         u32 v_hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
-        if (READ_ONCE(info->dir_node->bloom_mask) & (1ULL << (v_hash & 63)) &&
+        u64 bloom_mask = READ_ONCE(info->dir_node->bloom_mask);
+        if (bloom_mask & (1ULL << (v_hash & 63)) &&
             (res = nomount_resolve_rule_dentry(dir, dentry, info->dir_node, v_hash)) != ERR_PTR(-ENODATA))
                 return res;
     }
@@ -1155,14 +1160,14 @@ static int __nomount_inject_child_locked(struct nomount_dir_node *dir_node, stru
 static struct nomount_dir_node *__nomount_delete_child_locked(struct nomount_rule *rule)
 {
     struct nomount_dir_node *dir_node = rule->parent_dir;
-    struct nomount_dir_node *parent = dir_node && nm_dir_is_virtual(dir_node) ? dir_node : NULL;
+    struct nomount_dir_node *virtual_dir = dir_node && nm_dir_is_virtual(dir_node) ? dir_node : NULL;
     struct nomount_child_array *old_arr;
     struct nomount_rule **rules, *single;
     void *children;
     int old_count, target_idx = -1;
     u64 mask = 0;
 
-    if (unlikely(!dir_node || !(children = rcu_dereference_protected(dir_node->children, lockdep_is_held(&nomount_mutex))))) return parent;
+    if (unlikely(!dir_node || !(children = rcu_dereference_protected(dir_node->children, lockdep_is_held(&nomount_mutex))))) return virtual_dir;
     single = nm_children_is_single(children) ? nm_children_single_rule(children) : NULL;
     old_arr = single ? NULL : children;
     rules = old_arr ? nm_get_child_rules(old_arr) : &single;
@@ -1174,7 +1179,7 @@ static struct nomount_dir_node *__nomount_delete_child_locked(struct nomount_rul
             break;
         }
     }
-    if (target_idx == -1) return parent;
+    if (target_idx == -1) return virtual_dir;
 
     rcu_read_lock();
     if (old_count <= 2) {
@@ -1186,7 +1191,7 @@ static struct nomount_dir_node *__nomount_delete_child_locked(struct nomount_rul
             rcu_assign_pointer(dir_node->children, NULL);
             dir_node->bloom_mask = 0;
         }
-        if (old_count == 1 && !parent) {
+        if (old_count == 1 && !virtual_dir) {
             smp_mb();
             if (!rcu_access_pointer(dir_node->iop) && !rcu_access_pointer(dir_node->fop) &&
                 cmpxchg(&dir_node->v_inode, NULL, (struct inode *)-1L) == NULL)
@@ -1194,7 +1199,7 @@ static struct nomount_dir_node *__nomount_delete_child_locked(struct nomount_rul
         }
         rcu_read_unlock();
         if (old_arr) kfree_rcu(old_arr, rcu);
-        return parent;
+        return virtual_dir;
     }
 
     if (target_idx < old_count - 1) {
@@ -1211,7 +1216,7 @@ static struct nomount_dir_node *__nomount_delete_child_locked(struct nomount_rul
     for (int i = 0; i < old_arr->count; i++) mask |= (1ULL << (old_arr->hashes[i] & 63));
     dir_node->bloom_mask = mask;
     rcu_read_unlock();
-    return parent;
+    return virtual_dir;
 }
 
 static int nomount_generate_virtual_topology(struct nomount_rule *target_rule)
@@ -1226,7 +1231,6 @@ static int nomount_generate_virtual_topology(struct nomount_rule *target_rule)
     int i, p, err = 0;
     HLIST_HEAD(pending_list); 
 
-    /* yeah, this have a lot of mixed declarations, idgaf */
     while (p_len > 1) {
         for (i = p_len - 1; i >= 0; i--)
             if (v_path[i] == '/') break; 
