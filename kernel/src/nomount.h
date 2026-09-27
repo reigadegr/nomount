@@ -183,18 +183,39 @@ static inline int nm_unpack_pos(loff_t pos) {
 }
 
 /* --- UIDs Array RCU Management --- */
+/* Index of the first entry >= target. The array is kept sorted ascending, so
+ * lookups on the hot path are O(log n) instead of a linear scan. */
+static __always_inline int nm_uid_index(const struct nm_uid_array *arr, uid_t target, int count)
+{
+    int lo = 0, hi = count;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (arr->uids[mid] < target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 static inline int nm_uid_add(uid_t target)
 {
     struct nm_uid_array *old, *new_arr;
-    int count = 0;
+    int count = 0, pos = 0;
     if ((old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_mutex)))) {
-        for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) return -EEXIST;
+        count = old->count;
+        pos = nm_uid_index(old, target, count);
+        if (pos < count && old->uids[pos] == target) return -EEXIST;
     }
 
     if (!(new_arr = kmalloc(sizeof(*new_arr) + (count + 1) * sizeof(uid_t), GFP_KERNEL))) return -ENOMEM;
     new_arr->count = count + 1;
-    if (old) memcpy(new_arr->uids, old->uids, count * sizeof(uid_t));
-    new_arr->uids[count] = target;
+    if (old) {
+        memcpy(new_arr->uids, old->uids, pos * sizeof(uid_t));
+        memcpy(new_arr->uids + pos + 1, old->uids + pos, (count - pos) * sizeof(uid_t));
+    }
+    new_arr->uids[pos] = target;
     rcu_assign_pointer(nomount_uids, new_arr);
     if (old) kfree_rcu(old, rcu);
     return 0;
@@ -203,11 +224,12 @@ static inline int nm_uid_add(uid_t target)
 static inline int nm_uid_del(uid_t target)
 {
     struct nm_uid_array *old, *new_arr = NULL;
-    int count, target_idx = -1;
+    int count, target_idx;
 
     if (!(old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_mutex)))) return -ENOENT;
-    for (int i = 0; i < (count = old->count); i++) if (old->uids[i] == target) { target_idx = i; break; }
-    if (target_idx < 0) return -ENOENT;
+    count = old->count;
+    target_idx = nm_uid_index(old, target, count);
+    if (target_idx >= count || old->uids[target_idx] != target) return -ENOENT;
 
     if (count > 1) {
         if (!(new_arr = kmalloc(sizeof(*new_arr) + (count - 1) * sizeof(uid_t), GFP_KERNEL))) return -ENOMEM;

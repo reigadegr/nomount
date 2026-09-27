@@ -24,12 +24,9 @@ static __always_inline bool nomount_is_uid_blocked(uid_t target_uid)
         return false;
     rcu_read_lock();
     if ((arr = rcu_dereference(nomount_uids))) {
-        for (int i = 0; i < arr->count; i++) {
-            if (arr->uids[i] == target_uid) {
-                blocked = true;
-                break;
-            }
-        }
+        int count = READ_ONCE(arr->count);
+        int pos = nm_uid_index(arr, target_uid, count);
+        blocked = (pos < count && arr->uids[pos] == target_uid);
     }
     rcu_read_unlock();
     return blocked;
@@ -66,7 +63,6 @@ static bool __nomount_get_rule_info(struct nomount_dir_node *dir_node, const cha
 {
 	void *children;
 	struct nomount_rule *rule = NULL;
-	uid_t fsuid = current_fsuid().val;
 
 	if (likely((children = rcu_dereference(dir_node->children)))) {
 		if (nm_children_is_single(children)) {
@@ -82,7 +78,7 @@ static bool __nomount_get_rule_info(struct nomount_dir_node *dir_node, const cha
 			rule = nomount_bsearch_child(children, name, len, hash, NULL);
 		}
 
-		if (rule && rule->target_uid && rule->target_uid != fsuid)
+		if (rule && rule->target_uid && rule->target_uid != current_fsuid().val)
 			rule = NULL;
 	}
 
@@ -165,6 +161,7 @@ struct nomount_proxy_ctx {
     struct dir_context ctx;
     struct dir_context *orig_ctx;
     struct nomount_dir_node *dir_node;
+    u64 bloom_mask;
     bool emitted;
     bool uid_blocked;
 };
@@ -177,7 +174,7 @@ static NM_ACTOR_RET nomount_actor_proxy(struct dir_context *ctx, const char *nam
 
     if (proxy->dir_node && !proxy->uid_blocked) {
         u32 hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, name, namelen);
-        if ((READ_ONCE(proxy->dir_node->bloom_mask) & (1ULL << (hash & 63))) &&
+        if ((proxy->bloom_mask & (1ULL << (hash & 63))) &&
             nomount_get_rule_info(proxy->dir_node, name, namelen, hash, NULL, false)) {
             proxy->ctx.pos = offset;
             return NM_ACTOR_CONTINUE;
@@ -367,15 +364,17 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
     struct nomount_dir_node *dir_node = nm_iop ? READ_ONCE(nm_iop->dir_node) : NULL;
     struct dentry *res;
     u32 hash;
+    u64 bloom_mask;
 
     if (unlikely(!nm_iop || !dir_node))
         goto do_real_lookup;
 
-    if (likely(!READ_ONCE(dir_node->bloom_mask)))
+    bloom_mask = READ_ONCE(dir_node->bloom_mask);
+    if (likely(!bloom_mask))
         goto do_real_lookup;
 
     hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
-    if (likely(!(READ_ONCE(dir_node->bloom_mask) & (1ULL << (hash & 63)))))
+    if (likely(!(bloom_mask & (1ULL << (hash & 63)))))
         goto do_real_lookup;
 
     if (unlikely(nomount_is_uid_blocked(current_fsuid().val)))
@@ -404,6 +403,7 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
     const struct file_operations *orig_fop = nm_fop ? nm_fop->orig_fop : NULL;
     struct nomount_proxy_ctx proxy_ctx = { .ctx.actor = nomount_actor_proxy };
     int res = 0;
+    u64 bloom_mask;
     bool is_blocked;
 
     if (unlikely(!orig_fop || !dir_node))
@@ -415,7 +415,8 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
         return 0;
     }
 
-    if (likely(!READ_ONCE(dir_node->bloom_mask)))
+    bloom_mask = READ_ONCE(dir_node->bloom_mask);
+    if (likely(!bloom_mask))
         goto do_real_iterate;
 
     is_blocked = nomount_is_uid_blocked(current_fsuid().val);
@@ -425,6 +426,7 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
     proxy_ctx.ctx.pos = ctx->pos;
     proxy_ctx.orig_ctx = ctx;
     proxy_ctx.dir_node = dir_node;
+    proxy_ctx.bloom_mask = bloom_mask;
     proxy_ctx.emitted = false;
     proxy_ctx.uid_blocked = false;
 
@@ -695,7 +697,8 @@ static int nm_dir_iterate_dir(struct file *file, struct dir_context *ctx)
     if (real_file) {
         struct nomount_proxy_ctx proxy_ctx = {
             .ctx.actor = nomount_actor_proxy, .ctx.pos = ctx->pos, .orig_ctx = ctx,
-            .dir_node = dir_node, .emitted = false, .uid_blocked = nomount_is_uid_blocked(current_fsuid().val)
+            .dir_node = dir_node, .emitted = false, .uid_blocked = nomount_is_uid_blocked(current_fsuid().val),
+            .bloom_mask = dir_node ? READ_ONCE(dir_node->bloom_mask) : 0
         };
         res = nm_call_iterate(real_file, &proxy_ctx.ctx, real_file->f_op);
         ctx->pos = proxy_ctx.ctx.pos;
