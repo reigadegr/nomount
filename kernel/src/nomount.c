@@ -157,7 +157,6 @@ struct nomount_proxy_ctx {
     struct dir_context ctx;
     struct dir_context *orig_ctx;
     struct nomount_dir_node *dir_node;
-    u64 bloom_mask;
     bool emitted;
     bool uid_blocked;
 };
@@ -170,9 +169,7 @@ static NM_ACTOR_RET nomount_actor_proxy(struct dir_context *ctx, const char *nam
 
     if (proxy->dir_node && !proxy->uid_blocked) {
         u32 hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, name, namelen);
-
-        if ((proxy->bloom_mask & (1ULL << (hash & 63))) &&
-            nomount_get_rule_info(proxy->dir_node, name, namelen, hash, NULL, false)) {
+        if (nomount_get_rule_info(proxy->dir_node, name, namelen, hash, NULL, false)) {
             proxy->ctx.pos = offset;
             return NM_ACTOR_CONTINUE;
         }
@@ -322,29 +319,14 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
     struct nomount_dir_node *dir_node = nm_iop ? READ_ONCE(nm_iop->dir_node) : NULL;
     struct dentry *res;
     u32 hash;
-    u64 bloom_mask;
 
     if (unlikely(!nm_iop || !dir_node))
         goto do_real_lookup;
 
-    /* The bloom filter lives on the RCU-protected child view, so snapshot it
-     * inside a read-side critical section rather than reading dir_node directly. */
-    {
-        struct nomount_child_array *children;
-
-        rcu_read_lock();
-        children = rcu_dereference(dir_node->children);
-        bloom_mask = children ? children->bloom_mask : 0;
-        rcu_read_unlock();
-    }
-
-    if (likely(!bloom_mask))
+    if (likely(!rcu_access_pointer(dir_node->children)))
         goto do_real_lookup;
 
     hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
-    if (likely(!(bloom_mask & (1ULL << (hash & 63)))))
-        goto do_real_lookup;
-
     if (unlikely(nomount_is_uid_blocked(current_fsuid().val)))
         goto do_real_lookup;
 
@@ -371,7 +353,6 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
     const struct file_operations *orig_fop = nm_fop ? nm_fop->orig_fop : NULL;
     struct nomount_proxy_ctx proxy_ctx = { .ctx.actor = nomount_actor_proxy };
     int res = 0;
-    u64 bloom_mask;
     bool is_blocked;
 
     if (unlikely(!orig_fop || !dir_node))
@@ -383,16 +364,7 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
         return 0;
     }
 
-    {
-        struct nomount_child_array *children;
-
-        rcu_read_lock();
-        children = rcu_dereference(dir_node->children);
-        bloom_mask = children ? children->bloom_mask : 0;
-        rcu_read_unlock();
-    }
-
-    if (likely(!bloom_mask))
+    if (likely(!rcu_access_pointer(dir_node->children)))
         goto do_real_iterate;
 
     is_blocked = nomount_is_uid_blocked(current_fsuid().val);
@@ -403,7 +375,6 @@ static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *c
     proxy_ctx.orig_ctx = ctx;
     proxy_ctx.dir_node = dir_node;
 
-    proxy_ctx.bloom_mask = bloom_mask;
     res = nm_call_iterate(file, &proxy_ctx.ctx, orig_fop);
     ctx->pos = proxy_ctx.ctx.pos;
     
@@ -668,18 +639,9 @@ static int nm_dir_iterate_dir(struct file *file, struct dir_context *ctx)
     if (unlikely(nm_is_virtual_pos(ctx->pos))) goto emit_virtual;
 
     if (real_file) {
-        u64 bloom_mask;
-        struct nomount_child_array *children;
-
-        rcu_read_lock();
-        children = dir_node ? rcu_dereference(dir_node->children) : NULL;
-        bloom_mask = children ? children->bloom_mask : 0;
-        rcu_read_unlock();
-
         struct nomount_proxy_ctx proxy_ctx = {
             .ctx.actor = nomount_actor_proxy, .ctx.pos = ctx->pos, .orig_ctx = ctx,
-            .dir_node = dir_node, .emitted = false, .uid_blocked = nomount_is_uid_blocked(current_fsuid().val),
-            .bloom_mask = bloom_mask
+            .dir_node = dir_node, .emitted = false, .uid_blocked = nomount_is_uid_blocked(current_fsuid().val)
         };
         res = nm_call_iterate(real_file, &proxy_ctx.ctx, real_file->f_op);
         ctx->pos = proxy_ctx.ctx.pos;
@@ -707,16 +669,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 
     if (info->dir_node) {
         u32 v_hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, dentry->d_name.name, dentry->d_name.len);
-        struct nomount_child_array *children;
-        u64 bloom_mask;
-
-        rcu_read_lock();
-        children = rcu_dereference(info->dir_node->children);
-        bloom_mask = children ? children->bloom_mask : 0;
-        rcu_read_unlock();
-
-        if ((bloom_mask & (1ULL << (v_hash & 63))) &&
-            (res = nomount_resolve_rule_dentry(dir, dentry, info->dir_node, v_hash)) != ERR_PTR(-ENODATA))
+        if ((res = nomount_resolve_rule_dentry(dir, dentry, info->dir_node, v_hash)) != ERR_PTR(-ENODATA))
                 return res;
     }
 
