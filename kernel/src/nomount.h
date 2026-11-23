@@ -74,10 +74,32 @@ static inline void nm_view_bump(void)
     atomic_inc(&nm_view_gen);
 }
 
-/* stamp 低 1 位存 blocked 态，其余存代。 */
-static inline unsigned long nm_view_stamp(bool blocked)
+/*
+ * 32 位内核的 unsigned long 装不下 fsuid，只能退回「按 uid 区分的路径不缓存」。
+ * 目标平台是 arm64，这条分支仅作可编译性兜底。
+ */
+#define NM_STAMP_HAS_UID (BITS_PER_LONG >= 64)
+
+/*
+ * stamp 布局（64 位内核）：
+ *   [63:32] fsuid    [31:1] 视图代    [0] blocked
+ *
+ * 必须带 fsuid：一条路径若配了多条按 uid 区分的规则，不同 fsuid 该看到不同
+ * 内容。只按代缓存会让 A 判定出的结果被 B 复用。fsuid 占满高 32 位，既不截断
+ * 也不做哈希，不存在碰撞。
+ *
+ * 代取 31 位，回绕时跳过 0——0 要留给「从没打过戳」。
+ */
+static inline unsigned long nm_view_stamp(bool blocked, uid_t fsuid)
 {
-    return ((unsigned long)atomic_read(&nm_view_gen) << 1) | (blocked ? 1UL : 0UL);
+    unsigned long gen = (unsigned long)atomic_read(&nm_view_gen) & 0x7FFFFFFFUL;
+
+#if NM_STAMP_HAS_UID
+    if (!gen) gen = 1;
+    return ((unsigned long)fsuid << 32) | (gen << 1) | (blocked ? 1UL : 0UL);
+#else
+    return (gen << 1) | (blocked ? 1UL : 0UL);
+#endif
 }
 
 /* * Helpers to dynamically calculate the memory address of the strings / structs */

@@ -345,11 +345,23 @@ static bool nm_path_same(const struct path *a, const struct path *b)
  * 目录里随时可能被创建同名文件，VFS 创建时只会 invalidate backing 那一侧
  * 的 dentry，不会通知我们这份。这类重建只要一次 lookup，本来也不贵。
  */
-static inline void nm_stamp_dentry(struct dentry *dentry, bool uid_sensitive)
+static inline void nm_stamp_dentry(struct dentry *dentry, bool uid_sensitive,
+                                   const struct dentry_operations *orig_dops)
 {
-    if (!dentry || IS_ERR(dentry) || uid_sensitive) return;
+    uid_t fsuid;
+
+    if (!dentry || IS_ERR(dentry)) return;
+    /* 只给有 inode 的 dentry 打戳。负 dentry 记的是「这里没东西」，而 backing
+     * 里随时可能新建文件，VFS 只会 invalidate 它那一侧，缓存住就成了永久隐藏。 */
     if (!READ_ONCE(dentry->d_inode)) return;
-    WRITE_ONCE(dentry->d_time, nm_view_stamp(nm_is_uid_blocked(current_fsuid().val)));
+    /* 原文件系统自己拿 d_time 做一致性验证（FUSE auto_cache 之类），占了就会
+     * 破坏它的检查。这类 dentry 退回逐次验证。 */
+    if (orig_dops && orig_dops->d_revalidate) return;
+    /* 32 位内核装不下 fsuid，只能对按 uid 区分的路径放弃缓存。 */
+    if (!NM_STAMP_HAS_UID && uid_sensitive) return;
+
+    fsuid = current_fsuid().val;
+    WRITE_ONCE(dentry->d_time, nm_view_stamp(nm_is_uid_blocked(fsuid), fsuid));
 }
 
 /*
@@ -363,9 +375,11 @@ static bool nm_stamp_live(struct dentry *dentry, struct inode *inode)
 {
     unsigned long stamp = READ_ONCE(dentry->d_time);
     struct nm_inode_info *info;
+    uid_t fsuid;
     bool alive = true;
 
-    if (!stamp || stamp != nm_view_stamp(nm_is_uid_blocked(current_fsuid().val)))
+    fsuid = current_fsuid().val;
+    if (!stamp || stamp != nm_view_stamp(nm_is_uid_blocked(fsuid), fsuid))
         return false;
     if (!inode || !nm_inode_is_virtual(inode))
         return true;
@@ -503,6 +517,7 @@ out:
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     const struct inode_operations *orig_iop;
+    const struct dentry_operations *orig_dops = NULL;
     struct nm_rule_info rule_info = {0};
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
@@ -512,6 +527,7 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     orig_iop = rcu_dereference(dir->i_op);
     if (likely((nm_iop = nm_get_nm_iop(orig_iop)))) {
         orig_iop = nm_iop->orig_iop;
+        orig_dops = nm_get_orig_dops(nm_iop);
         struct nm_dir_node *dir_node = rcu_dereference(nm_iop->dir_node);
         struct nm_leaf *leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
         has_leaf = leaf != NULL;
@@ -526,7 +542,7 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
 
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info, flags);
-        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive, orig_dops);
         return res;
     }
 
@@ -537,7 +553,7 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
              * 文件系统自己的 d_time 用途，不能动。 */
             if (has_leaf && !nm_is_pseudo_fs(dir->i_sb)) {
                 nm_hijack_dentry_ops(dir, target, false);
-                nm_stamp_dentry(target, uid_sensitive);
+                nm_stamp_dentry(target, uid_sensitive, orig_dops);
             }
         }
         return res;
@@ -1014,7 +1030,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     rcu_read_unlock();
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info, flags);
-        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive, NULL);
         return res;
     }
 
@@ -1048,7 +1064,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         path_get(&rule_info.r_path);
         dput(backing);
         res = nm_materialize_rule(dir, dentry, &rule_info, flags);
-        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive, NULL);
         return res;
     }
 
@@ -1057,7 +1073,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         if (!IS_ERR(res ? res : dentry)) {
             if (has_leaf && !nm_is_pseudo_fs(r_dir->i_sb)) {
                 nm_hijack_dentry_ops(dir, res ? res : dentry, false);
-                nm_stamp_dentry(res ? res : dentry, uid_sensitive);
+                nm_stamp_dentry(res ? res : dentry, uid_sensitive, NULL);
             }
         }
         return res;
@@ -1067,7 +1083,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 negative_dentry:
     nm_hijack_dentry_ops(dir, dentry, true);
     d_add(dentry, NULL);
-    nm_stamp_dentry(dentry, uid_sensitive);
+    nm_stamp_dentry(dentry, uid_sensitive, NULL);
     return NULL;
 }
 
@@ -1200,17 +1216,22 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
                            bound->dir_node ? smp_load_acquire(&bound->dir_node->owner) : NULL;
     if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules))
         leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
-    if (leaf && !(uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
+    if (leaf && !(uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val)))) {
         struct nm_rule_array *arr = rcu_dereference(leaf->rules);
-        has_rule = true;
+
+        /* uid 敏感性与「本 fsuid 是否命中」是两件事：一条路径配了多条按 uid
+         * 区分的规则时，没命中也照样敏感，缓存必须带 fsuid 才能区分身份。 */
         uid_sensitive = arr && arr->uid_count > 0;
-        if (rule->flags & NM_FLAG_WHITEOUT)
-            whiteout = true;
-        else if (inode && nm_inode_is_virtual(inode)) {
-            if (rule->flags & NM_FLAG_IS_DIR)
-                match_rule = nm_inode_matches_binding(inode, &rule->r_path, leaf->this_dir, rule->flags & NM_FLAG_OPAQUE);
-            else
-                match_rule = nm_binding_matches_rule(inode, rule);
+        if ((rule = nm_select_rule(leaf, fsuid))) {
+            has_rule = true;
+            if (rule->flags & NM_FLAG_WHITEOUT)
+                whiteout = true;
+            else if (inode && nm_inode_is_virtual(inode)) {
+                if (rule->flags & NM_FLAG_IS_DIR)
+                    match_rule = nm_inode_matches_binding(inode, &rule->r_path, leaf->this_dir, rule->flags & NM_FLAG_OPAQUE);
+                else
+                    match_rule = nm_binding_matches_rule(inode, rule);
+            }
         }
     }
 
@@ -1221,11 +1242,11 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     // 补上之后后续访问又能回到快路径，不会一直停在慢路径上。
     if (whiteout && !inode) {
         if (weak) return 0;
-        nm_stamp_dentry(dentry, uid_sensitive);
+        nm_stamp_dentry(dentry, uid_sensitive, orig_dops);
         return 1;
     }
     if (match_rule) {
-        nm_stamp_dentry(dentry, uid_sensitive);
+        nm_stamp_dentry(dentry, uid_sensitive, orig_dops);
         return 1;
     }
     if (!has_rule && inode && nm_inode_is_virtual(inode)) {
@@ -1249,8 +1270,29 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
         }
     }
 
-    if (has_rule || (!uid_blocked && nm_is_our_dops(iop, READ_ONCE(dentry->d_op))) || (inode && nm_inode_is_virtual(inode)))
+    if (has_rule || (inode && nm_inode_is_virtual(inode)))
         return nm_drop_dentry(dentry, flags, weak);
+
+    if (!uid_blocked && nm_is_our_dops(iop, READ_ONCE(dentry->d_op))) {
+        /*
+         * 有 leaf、但没命中本 fsuid 的规则，而且 dentry 是真实文件系统对象。
+         * 这一轮的结论和上一轮完全一样：该看到什么还是什么。原来这里无条件
+         * 丢弃，等于每次 stat 都从头重建——实测 /data/DNA 因此比同层目录慢
+         * 3.9 倍，而它其实什么都没藏。
+         *
+         * 视图代和 fsuid 都没变，结果就不可能变，补一次戳留住即可。真正会让
+         * 视图变的情况前面都处理了：命中规则走 has_rule 分支丢弃重建，虚拟
+         * inode 走上面对 backing 的核对；规则和 uid 集合变更会推代让所有旧戳
+         * 一次性失效。
+         *
+         * 原文件系统自己带 d_revalidate 的，交还给它判断，别替它做决定。
+         */
+        if (!weak && !(orig_dops && orig_dops->d_revalidate)) {
+            nm_stamp_dentry(dentry, uid_sensitive, orig_dops);
+            return 1;
+        }
+        return nm_call_orig_revalidate(orig_dops, parent_inode, name, dentry, flags);
+    }
     return nm_call_orig_revalidate(orig_dops, parent_inode, name, dentry, flags);
 }
 
