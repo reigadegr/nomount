@@ -49,6 +49,37 @@ static LIST_HEAD(nm_sb_list);
 static struct nm_rule_array *nm_retired_arrays;
 static struct nm_leaf *nm_retired_leaves;
 
+/*
+ * 视图代（view generation）
+ *
+ * 规则集与 uid 集合每变一次就 +1。dentry 用 d_time 记住「建视图时的代，
+ * 外加当时是否处于 blocked 态」，d_revalidate 只要发现代没变就直接放行，
+ * 省掉整轮规则匹配和 dentry 丢弃。
+ *
+ * 为什么原来要每次丢：d_revalidate 无条件返回「无效」，dentry 就被踢出
+ * dcache，下一次 lookup 从头物化一遍（iget5_locked + d_splice_alias + 换
+ * d_op）。规则不变时这一整轮的结果和上一轮完全一样，纯属重复劳动——每
+ * 一次 stat 多付 900ns，而且所有子路径跟着一起失效，因为父 dentry 每轮
+ * 都是新的对象。
+ *
+ * 生产环境规则在开机时批量下发、之后不动，所以稳态必然命中。
+ * 运行期改规则也能立刻生效：代变了，所有旧 stamp 一次性作废。
+ *
+ * 初值取 1 而不是 0，让 d_time 的 0（从没 stamp 过）天然不等于任何合法代。
+ */
+static atomic_t nm_view_gen = ATOMIC_INIT(1);
+
+static inline void nm_view_bump(void)
+{
+    atomic_inc(&nm_view_gen);
+}
+
+/* stamp 低 1 位存 blocked 态，其余存代。 */
+static inline unsigned long nm_view_stamp(bool blocked)
+{
+    return ((unsigned long)atomic_read(&nm_view_gen) << 1) | (blocked ? 1UL : 0UL);
+}
+
 /* * Helpers to dynamically calculate the memory address of the strings / structs */
 #define nm_get_child_name(leaf) ((leaf)->paths + (leaf)->v_len - (leaf)->child_len)
 
@@ -268,6 +299,7 @@ static inline int nm_uid_add(uid_t target)
     nm_uid_bloom_set(new_arr, target);
     rcu_assign_pointer(nm_uids, new_arr);
     if (old) kfree_rcu(old, rcu);
+    nm_view_bump();
     return 0;
 }
 
@@ -292,6 +324,7 @@ static inline int nm_uid_del(uid_t target)
 
     rcu_assign_pointer(nm_uids, new_arr);
     kfree_rcu(old, rcu);
+    nm_view_bump();
     return 0;
 }
 

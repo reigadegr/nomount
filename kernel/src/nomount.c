@@ -314,6 +314,70 @@ static inline void nm_emit_virtual_children(struct dir_context *ctx, struct nm_d
 
 static inline umode_t nm_visible_mode(umode_t mode) { return mode & ~(S_ISUID | S_ISGID); }
 
+/*
+ * 两条路径是否指的是同一个东西。
+ *
+ * 不能只比指针：nm_rebind_path 在 backing 被删重建之后会把 r_path.dentry
+ * 换成新 lookup 出来的对象，而规则里存的还是旧指针。指针不等但同父同名，
+ * 语义上就是同一条路径，此时应该判「仍然匹配」；否则会永久失配，每轮都
+ * 重建一次 dentry——正是要消除的那种开销。
+ * 这与 nm_binding_matches_rule 里对文件规则的判法保持一致。
+ */
+static bool nm_path_same(const struct path *a, const struct path *b)
+{
+    const struct dentry *da = a->dentry, *db = b->dentry;
+
+    if (da == db) return true;
+    if (!da || !db) return false;
+    return da->d_parent == db->d_parent && da->d_name.len == db->d_name.len &&
+           !memcmp(da->d_name.name, db->d_name.name, da->d_name.len);
+}
+
+/*
+ * 给 dentry 盖上当前视图的代。
+ *
+ * 只在「规则对 uid 不敏感」时盖：一个路径若配了多条按 uid 区分的规则，
+ * 不同 fsuid 该看到不同内容，必须每次都走完整判定，不能被 stamp 短路。
+ * uid_count == 0 表示只有一条对所有 uid 生效的规则（或纯透传的锚点），
+ * 同一代内视图唯一，可以放心缓存。
+ *
+ * 空 dentry（negative）故意不打戳：它记的是「这里没有东西」，而 backing
+ * 目录里随时可能被创建同名文件，VFS 创建时只会 invalidate backing 那一侧
+ * 的 dentry，不会通知我们这份。这类重建只要一次 lookup，本来也不贵。
+ */
+static inline void nm_stamp_dentry(struct dentry *dentry, bool uid_sensitive)
+{
+    if (!dentry || IS_ERR(dentry) || uid_sensitive) return;
+    if (!READ_ONCE(dentry->d_inode)) return;
+    WRITE_ONCE(dentry->d_time, nm_view_stamp(nm_is_uid_blocked(current_fsuid().val)));
+}
+
+/*
+ * dentry 上的 stamp 是否仍然代表当前视图。
+ *
+ * 代没变、blocked 态没变，说明规则集和身份都跟建视图时一样，绑定必然仍然
+ * 成立。虚拟 inode 额外确认一下 backing 还在：规则指向的文件被删掉之后必须
+ * 走慢路径重新绑定，不能一直指着一条已经没有链接的 inode。
+ */
+static bool nm_stamp_live(struct dentry *dentry, struct inode *inode)
+{
+    unsigned long stamp = READ_ONCE(dentry->d_time);
+    struct nm_inode_info *info;
+    bool alive = true;
+
+    if (!stamp || stamp != nm_view_stamp(nm_is_uid_blocked(current_fsuid().val)))
+        return false;
+    if (!inode || !nm_inode_is_virtual(inode))
+        return true;
+
+    rcu_read_lock();
+    info = rcu_dereference(inode->i_private);
+    if (info && info->r_path.dentry && unlikely(nm_backing_gone(info->r_path.dentry)))
+        alive = false;
+    rcu_read_unlock();
+    return alive;
+}
+
 static void nm_init_prealloc_inode(struct inode *inode, struct nm_inode_info *info, unsigned long v_ino)
 {
     struct inode *r_inode = info->r_path.dentry ? d_backing_inode(info->r_path.dentry) : NULL;
@@ -354,7 +418,7 @@ static bool nm_inode_matches_binding(struct inode *inode, const struct path *pat
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
     struct inode *r_inode;
 
-    if (!info || info->node != node || !path_equal(&info->r_path, path) || (node && info->opaque != opaque))
+    if (!info || info->node != node || !nm_path_same(&info->r_path, path) || (node && info->opaque != opaque))
         return false;
     r_inode = path->dentry ? d_backing_inode(path->dentry) : NULL;
     return nm_inode_matches_attrs(inode, r_inode);
@@ -442,7 +506,7 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     struct nm_rule_info rule_info = {0};
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
-    bool found = false, has_leaf = false;
+    bool found = false, has_leaf = false, uid_sensitive = false;
 
     rcu_read_lock();
     orig_iop = rcu_dereference(dir->i_op);
@@ -453,18 +517,29 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
         has_leaf = leaf != NULL;
         if (has_leaf) {
             uid_t fsuid = current_fsuid().val;
+            struct nm_rule_array *arr = rcu_dereference(leaf->rules);
+            uid_sensitive = arr && arr->uid_count > 0;
             if (likely(!nm_is_uid_blocked(fsuid))) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
         }
     }
     rcu_read_unlock();
 
-    if (found)
-        return nm_materialize_rule(dir, dentry, &rule_info, flags);
+    if (found) {
+        res = nm_materialize_rule(dir, dentry, &rule_info, flags);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        return res;
+    }
 
     if (likely(orig_iop && orig_iop->lookup)) {
         target = (res = orig_iop->lookup(dir, dentry, flags)) ? res : dentry;
-        if (likely(!IS_ERR(target)) && has_leaf && !nm_is_pseudo_fs(dir->i_sb))
-            nm_hijack_dentry_ops(dir, target, false);
+        if (likely(!IS_ERR(target))) {
+            /* 只有真被我们接管过 d_op 的 dentry 才打戳。没接管的可能还留着
+             * 文件系统自己的 d_time 用途，不能动。 */
+            if (has_leaf && !nm_is_pseudo_fs(dir->i_sb)) {
+                nm_hijack_dentry_ops(dir, target, false);
+                nm_stamp_dentry(target, uid_sensitive);
+            }
+        }
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -922,7 +997,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     struct inode *r_dir;
     struct dentry *res;
     uid_t fsuid;
-    bool uid_blocked, found = false, has_leaf = false;
+    bool uid_blocked, found = false, has_leaf = false, uid_sensitive = false;
 
     if (unlikely(!info))
         goto negative_dentry;
@@ -931,9 +1006,17 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     rcu_read_lock();
     struct nm_leaf *leaf = nm_find_leaf_in_dir(READ_ONCE(info->dir_node), dentry->d_name.name, dentry->d_name.len);
     has_leaf = leaf != NULL;
-    if (leaf && !uid_blocked) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+    if (leaf) {
+        struct nm_rule_array *arr = rcu_dereference(leaf->rules);
+        uid_sensitive = arr && arr->uid_count > 0;
+        if (!uid_blocked) found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+    }
     rcu_read_unlock();
-    if (found) return nm_materialize_rule(dir, dentry, &rule_info, flags);
+    if (found) {
+        res = nm_materialize_rule(dir, dentry, &rule_info, flags);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        return res;
+    }
 
     if (info->opaque && !uid_blocked)
         goto negative_dentry;
@@ -964,13 +1047,19 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         rule_info.r_path.dentry = backing;
         path_get(&rule_info.r_path);
         dput(backing);
-        return nm_materialize_rule(dir, dentry, &rule_info, flags);
+        res = nm_materialize_rule(dir, dentry, &rule_info, flags);
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive);
+        return res;
     }
 
     if (r_dir->i_op->lookup) {
         res = r_dir->i_op->lookup(r_dir, dentry, flags);
-        if (!IS_ERR(res ? res : dentry) && has_leaf && !nm_is_pseudo_fs(r_dir->i_sb))
-            nm_hijack_dentry_ops(dir, res ? res : dentry, false);
+        if (!IS_ERR(res ? res : dentry)) {
+            if (has_leaf && !nm_is_pseudo_fs(r_dir->i_sb)) {
+                nm_hijack_dentry_ops(dir, res ? res : dentry, false);
+                nm_stamp_dentry(res ? res : dentry, uid_sensitive);
+            }
+        }
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -978,6 +1067,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 negative_dentry:
     nm_hijack_dentry_ops(dir, dentry, true);
     d_add(dentry, NULL);
+    nm_stamp_dentry(dentry, uid_sensitive);
     return NULL;
 }
 
@@ -1066,11 +1156,35 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     struct nm_dir_ops *iop = NULL;
     struct nm_rule *rule;
     bool has_rule = false, whiteout = false, match_rule = false, uid_blocked = false;
+    bool uid_sensitive = false;
     uid_t fsuid;
 
     if (unlikely(!parent_inode)) return 1;
     if ((flags & LOOKUP_RENAME_TARGET) && inode && nm_inode_is_virtual(inode))
         return (flags & LOOKUP_RCU) ? -ECHILD : -EPERM;
+
+    /*
+     * 快路径：规则集和身份都没变，上一轮建好的绑定直接复用，整轮规则匹配
+     * 和 dentry 丢弃都省掉。两个前提：
+     *   - weak 模式不走这里，它对 negative dentry 的语义是「必须重新确认」；
+     *   - 原文件系统自己有 d_revalidate 时也不走，别把它的一致性检查跳掉。
+     */
+    if (!weak) {
+        bool orig_ok = true;
+
+        rcu_read_lock();
+        {
+            const struct inode_operations *piop = rcu_dereference(parent_inode->i_op);
+            struct nm_dir_ops *piop_nm = piop ? nm_get_nm_iop(piop) : NULL;
+            const struct dentry_operations *odops = nm_get_orig_dops(piop_nm);
+
+            if (odops && odops->d_revalidate) orig_ok = false;
+        }
+        rcu_read_unlock();
+
+        if (orig_ok && nm_stamp_live(dentry, inode))
+            return 1;
+    }
 
     rcu_read_lock();
     const struct inode_operations *parent_iop = rcu_dereference(parent_inode->i_op);
@@ -1087,7 +1201,9 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     if (!leaf || leaf->parent_dir != parent_dir || !nm_child_matches(leaf, name->name, name->len) || !rcu_access_pointer(leaf->rules))
         leaf = nm_find_leaf_in_dir(parent_dir, name->name, name->len);
     if (leaf && !(uid_blocked = nm_is_uid_blocked((fsuid = current_fsuid().val))) && (rule = nm_select_rule(leaf, fsuid))) {
+        struct nm_rule_array *arr = rcu_dereference(leaf->rules);
         has_rule = true;
+        uid_sensitive = arr && arr->uid_count > 0;
         if (rule->flags & NM_FLAG_WHITEOUT)
             whiteout = true;
         else if (inode && nm_inode_is_virtual(inode)) {
@@ -1101,8 +1217,17 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
     if (!has_rule) orig_dops = nm_get_orig_dops(iop);
     rcu_read_unlock();
 
-    if (whiteout && !inode) return weak ? 0 : 1;
-    if (match_rule) return 1;
+    // 走到这里说明视图是对的，补一次 stamp：规则刚变更过时快路径会失效一次，
+    // 补上之后后续访问又能回到快路径，不会一直停在慢路径上。
+    if (whiteout && !inode) {
+        if (weak) return 0;
+        nm_stamp_dentry(dentry, uid_sensitive);
+        return 1;
+    }
+    if (match_rule) {
+        nm_stamp_dentry(dentry, uid_sensitive);
+        return 1;
+    }
     if (!has_rule && inode && nm_inode_is_virtual(inode)) {
         struct nm_inode_info *info = READ_ONCE(inode->i_private);
         if (info && info->backing_child) {
@@ -1814,6 +1939,8 @@ static void nm_publish_rules_locked(struct nm_leaf *leaf, struct nm_rule_array *
     rcu_assign_pointer(leaf->rules, array);
     if (parent && before && !after) WRITE_ONCE(parent->readdir_count, parent->readdir_count - 1);
     if (old != &nm_virtual_parent_rules) nm_retire_array_locked(old);
+    /* 规则内容变了，所有 dentry 上记的代一起作废，下一轮访问重新判定。 */
+    nm_view_bump();
 }
 
 static void nm_retire_leaf_locked(struct nm_leaf *leaf)
@@ -1825,6 +1952,8 @@ static void nm_retire_leaf_locked(struct nm_leaf *leaf)
     nm_retired_leaves = leaf;
     if (array != &nm_virtual_parent_rules) nm_retire_array_locked(array);
     else schedule_work(&nm_reclaim_work);
+    /* 路径退出规则集，之前缓存的 dentry 视图必须重判。 */
+    nm_view_bump();
 }
 
 static void nm_prepare_native_file(struct nm_leaf *leaf, struct nm_dir_node *dir_node, const struct path *parent, const char *name)
@@ -2064,6 +2193,8 @@ static int nm_add_rule_locked(const char *v_path, const char *r_path, u16 v_len,
             return err;
         }
         hash_add(nm_leaves_ht, &leaf->ht_node, leaf->v_hash);
+        /* 新路径加入规则集：之前可能已经被当成「无规则」缓存过，作废重判。 */
+        nm_view_bump();
     } else {
         if (new_dir)
             smp_store_release(&new_dir->owner, leaf);
@@ -2146,6 +2277,7 @@ static void nm_clear_state(int clear_flags)
     }
     if (clear_flags & NM_CLEAR_EXIT) nm_restore_superblocks();
     mutex_unlock(&nm_mutex);
+    nm_view_bump();
 }
 
 /*** Payload Communication API ***/
@@ -2243,6 +2375,8 @@ static int nm_process_payload(unsigned long user_addr)
 
         case NM_CMD_BLOCK_ISOLATED_UIDS:
             WRITE_ONCE(nm_block_isolated_uids, payload->arg1 != 0);
+            /* 整个隔离态翻了，所有 dentry 的可见性都可能变。 */
+            nm_view_bump();
             break;
 
         case NM_CMD_GET_ISOLATED_STATE:
