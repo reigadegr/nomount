@@ -135,9 +135,32 @@ static int nm_rebind_path(struct nm_rule_info *rule_info)
     const char *name;
     unsigned seq;
     u16 len;
+    umode_t want;
 
-    if (!old_inode) return -ENOENT;
     if (!nm_backing_gone(dentry)) return 0;
+
+    /*
+     * 绑定时记下的那个 inode 已经不能用了，有两种形态：unlink 之后 nlink
+     * 掉到 0，以及 dentry 就地变负。后者不是边角情况——「删掉整个目录再把
+     * 暂存目录改名过来」这种覆盖方式（模块更新、开机脚本动态生成内容都用
+     * 它）留下的就是负 dentry。
+     *
+     * 旧实现在这里先判 !old_inode 直接 -ENOENT，等于把最常见的那一类当成
+     * 永久失效：规则还在、父目录还在、名字也没变，只是内容换了个 inode，
+     * 却再也读不到，只能重新下发规则或重启才能恢复。而 nm_backing_gone()
+     * 本来就把负 dentry 报成 gone，语义上正是「该重绑」。
+     *
+     * 负 dentry 没有旧 inode 可以参照类型，改用规则自己声明的类型，少掉这
+     * 层约束就可能把同名的目录当成文件映射过来。
+     */
+    if (old_inode)
+        want = old_inode->i_mode & S_IFMT;
+    else if (rule_info->flags & NM_FLAG_IS_DIR)
+        want = S_IFDIR;
+    else if (rule_info->flags & NM_FLAG_WHITEOUT)
+        return -ENOENT;
+    else
+        want = S_IFREG;
 
     for (;;) {
         seq = raw_seqcount_begin(&dentry->d_seq);
@@ -148,12 +171,18 @@ static int nm_rebind_path(struct nm_rule_info *rule_info)
         dput(parent);
     }
 
+    /* 父目录自己也不在了，那就真的救不回来。 */
+    if (!d_backing_inode(parent)) {
+        dput(parent);
+        return -ENOENT;
+    }
+
     new = nm_lookup_one_len_unlocked(name, parent, len);
     dput(parent);
     if (IS_ERR(new)) return PTR_ERR(new);
 
     new_inode = d_backing_inode(new);
-    if (!d_is_positive(new) || new->d_sb != dentry->d_sb || !new_inode || nm_inode_is_virtual(new_inode) || d_mountpoint(new) || ((new_inode->i_mode ^ old_inode->i_mode) & S_IFMT)) {
+    if (!d_is_positive(new) || new->d_sb != dentry->d_sb || !new_inode || nm_inode_is_virtual(new_inode) || d_mountpoint(new) || ((new_inode->i_mode ^ want) & S_IFMT)) {
         dput(new);
         return -ENOENT;
     }
@@ -466,6 +495,35 @@ static int nm_cached_inode_test(struct inode *inode, void *data)
     return nm_inode_is_virtual(inode) && nm_inode_matches_binding(inode, &info->r_path, info->node, info->opaque);
 }
 
+/*
+ * 把重绑得到的新 dentry 写回已经缓存下来的虚拟 inode。
+ *
+ * nm_rebind_path() 改的是调用者栈上的 rule_info 副本，规则表里的 r_path 还
+ * 指着被替换掉的旧对象。而 iget5_locked() 会因为「同父同名且属性一致」命中
+ * 旧 inode 并直接复用它——旧 inode 的 info->r_path 仍是死 dentry。结果是
+ * nm_stamp_live() 每轮都判「backing 没了」，快路径永远进不去：每次 stat 都
+ * 走 drop + 二次 lookup + 重绑，开销退回改造前的水平，而且不会自愈。
+ *
+ * 旧 dentry 由规则表持有一份引用（nm_prepare_rule 的 kern_path），交换后
+ * dput 的只是 inode 这一份，对象本身不会在此之前被释放，正在使用它的读者
+ * 也不会踩空。并发材质化时用 cmpxchg 只允许一个写入者成功。
+ */
+static void nm_refresh_binding(struct inode *inode, const struct path *path)
+{
+    struct nm_inode_info *info = READ_ONCE(inode->i_private);
+    struct dentry *old;
+
+    if (!info || !path->dentry) return;
+    old = READ_ONCE(info->r_path.dentry);
+    if (old == path->dentry) return;
+
+    path_get(path);
+    if (cmpxchg(&info->r_path.dentry, old, path->dentry) == old)
+        dput(old);
+    else
+        path_put(path);
+}
+
 static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dentry,
                                           struct nm_rule_info *rule_info, unsigned int flags)
 {
@@ -495,6 +553,9 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
         *info = probe;
         nm_init_prealloc_inode(inode, info, rule_info->v_ino);
         unlock_new_inode(inode);
+    } else {
+        /* 复用了上一个 inode：它的绑定可能还指着刚被重绑掉的旧对象。 */
+        nm_refresh_binding(inode, &rule_info->r_path);
     }
     res = d_splice_alias(inode, dentry);
     if (!IS_ERR(res))
