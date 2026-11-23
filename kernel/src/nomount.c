@@ -517,7 +517,6 @@ out:
 static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
     const struct inode_operations *orig_iop;
-    const struct dentry_operations *orig_dops = NULL;
     struct nm_rule_info rule_info = {0};
     struct nm_dir_ops *nm_iop = NULL;
     struct dentry *res, *target;
@@ -527,7 +526,6 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
     orig_iop = rcu_dereference(dir->i_op);
     if (likely((nm_iop = nm_get_nm_iop(orig_iop)))) {
         orig_iop = nm_iop->orig_iop;
-        orig_dops = nm_get_orig_dops(nm_iop);
         struct nm_dir_node *dir_node = rcu_dereference(nm_iop->dir_node);
         struct nm_leaf *leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
         has_leaf = leaf != NULL;
@@ -542,7 +540,8 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
 
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info, flags);
-        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive, orig_dops);
+        /* 材质化出来的是虚拟 inode，d_time 归我们自己用，不必问原 dops。 */
+        nm_stamp_dentry(IS_ERR(res) ? NULL : (res ? res : dentry), uid_sensitive, NULL);
         return res;
     }
 
@@ -553,7 +552,9 @@ static struct dentry *nm_hijacked_lookup(struct inode *dir, struct dentry *dentr
              * 文件系统自己的 d_time 用途，不能动。 */
             if (has_leaf && !nm_is_pseudo_fs(dir->i_sb)) {
                 nm_hijack_dentry_ops(dir, target, false);
-                nm_stamp_dentry(target, uid_sensitive, orig_dops);
+                /* 原 dops 是上面这一步才记下来的，必须在这之后再取；否则首次
+                 * 访问拿到 NULL，会误给带 d_revalidate 的 dentry 打戳。 */
+                nm_stamp_dentry(target, uid_sensitive, nm_get_orig_dops(nm_iop));
             }
         }
         return res;
@@ -1275,18 +1276,27 @@ static int nm_d_revalidate_common(struct inode *parent_inode, const struct qstr 
 
     if (!uid_blocked && nm_is_our_dops(iop, READ_ONCE(dentry->d_op))) {
         /*
-         * 有 leaf、但没命中本 fsuid 的规则，而且 dentry 是真实文件系统对象。
-         * 这一轮的结论和上一轮完全一样：该看到什么还是什么。原来这里无条件
-         * 丢弃，等于每次 stat 都从头重建——实测 /data/DNA 因此比同层目录慢
-         * 3.9 倍，而它其实什么都没藏。
+         * 走到这里：这条路径配了 leaf，但本 fsuid 一条规则都没命中，且 dentry
+         * 带着我们注入的 d_op。
          *
-         * 视图代和 fsuid 都没变，结果就不可能变，补一次戳留住即可。真正会让
+         * 负 dentry 必须丢。它记的「这里没东西」只对当初建它的那个 fsuid 成立，
+         * 而 dentry 是整个系统共享的：把某个 uid 的 whiteout 结论留在 dcache 里，
+         * 别的身份来问也会拿到 ENOENT，一个 uid 的隐藏就扩散成了全局隐藏——
+         * 表现为一大批无关进程访问自己的路径全部失败。重查一次 lookup 才能拿到
+         * 当前身份真正该看到的那个对象。
+         *
+         * 正 dentry 且是真实文件系统对象则可以留：本 fsuid 什么都没命中，答案
+         * 就是「原样透传」，与上一轮相同。原来这里无条件丢弃，等于每次 stat 都
+         * 从头重建——实测 /data/DNA 因此比同层目录慢 3.9 倍，而它其实什么都没藏。
+         *
+         * 视图代和 fsuid 都没变，结论就不可能变，补一次戳留住即可。真正会让
          * 视图变的情况前面都处理了：命中规则走 has_rule 分支丢弃重建，虚拟
-         * inode 走上面对 backing 的核对；规则和 uid 集合变更会推代让所有旧戳
-         * 一次性失效。
+         * inode 走上面核对 backing；规则和 uid 集合变更会推代让所有旧戳一次失效。
          *
          * 原文件系统自己带 d_revalidate 的，交还给它判断，别替它做决定。
          */
+        if (!inode)
+            return nm_drop_dentry(dentry, flags, weak);
         if (!weak && !(orig_dops && orig_dops->d_revalidate)) {
             nm_stamp_dentry(dentry, uid_sensitive, orig_dops);
             return 1;
